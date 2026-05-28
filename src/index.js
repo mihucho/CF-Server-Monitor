@@ -1,4 +1,4 @@
-import { initDatabase, cleanupOldData } from './database/schema.js';
+import { initDatabase, cleanupOldData, getMetricsHistory } from './database/schema.js';
 import { handleAdminAPI } from './handlers/admin.js';
 import { handleAdminUI } from './handlers/admin-ui.js';
 import { handleUpdate } from './handlers/update.js';
@@ -9,46 +9,6 @@ import { checkAuth, authResponse } from './middleware/auth.js';
 const historyCache = new Map();
 const CACHE_TTL = 60000;
 const MAX_HOURS = 72;
-
-function getBucketSeconds(hours) {
-  if (hours <= 12) return 120;
-  if (hours <= 24) return 300;
-  if (hours <= 48) return 600;
-  return 1200;
-}
-
-async function getMetricsHistory(db, serverId, rangeHours, columns) {
-  const bucketSeconds = getBucketSeconds(rangeHours);
-  const now = Date.now();
-  const cutoff = now - (rangeHours * 60 * 60 * 1000);
-  
-  const selectColumns = columns.split(',').map(col => `b1.${col.trim()}`).join(', ');
-  
-  const query = `
-    WITH bucketed AS (
-      SELECT id, server_id, timestamp, ${columns},
-        CAST(timestamp / (? * 1000) AS INTEGER) AS bucket
-      FROM metrics_history
-      WHERE server_id = ?
-        AND typeof(timestamp) = 'integer'
-        AND timestamp >= ?
-    )
-    SELECT b1.id, b1.server_id, b1.timestamp, ${selectColumns}
-    FROM bucketed b1
-    WHERE b1.timestamp = (
-      SELECT MIN(b2.timestamp)
-      FROM bucketed b2
-      WHERE b2.bucket = b1.bucket
-    )
-    ORDER BY b1.timestamp ASC
-  `;
-  
-  const result = await db.prepare(query)
-    .bind(bucketSeconds, serverId, cutoff)
-    .all();
-  
-  return result.results;
-}
 
 async function fetchHistoryData(env, sys, request, id, hours, columns) {
   if (sys.is_public !== 'true' && !checkAuth(request, env)) {
@@ -75,25 +35,14 @@ async function fetchHistoryData(env, sys, request, id, hours, columns) {
     });
   }
   
-  const sampled = await getMetricsHistory(env.DB, id, clampedHours, columns);
-  
-  const processed = sampled.map(row => {
-    let ts = row.timestamp;
-    if (typeof ts === 'string') {
-      ts = new Date(ts).getTime();
-    }
-    return {
-      ...row,
-      timestamp: ts
-    };
-  });
+  const data = await getMetricsHistory(env.DB, id, clampedHours, columns);
   
   historyCache.set(cacheKey, {
     timestamp: Date.now(),
-    data: processed
+    data: data
   });
   
-  return new Response(JSON.stringify(processed), {
+  return new Response(JSON.stringify(data), {
     headers: { 'Content-Type': 'application/json', 'X-Cache': 'MISS' }
   });
 }
@@ -107,7 +56,20 @@ export default {
     const method = request.method;
     const path = url.pathname;
 
+    async function handleManualCleanup() {
+      if (!checkAuth(request, env)) {
+        return authResponse(sys.admin_title);
+      }
+      
+      const result = await cleanupOldData(env.DB, true);
+      
+      return new Response(JSON.stringify(result), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     const routes = [
+      { method: 'GET', path: '/clear', handler: handleManualCleanup },
       { method: 'POST', path: '/admin/api', handler: () => handleAdminAPI(request, env, sys) },
       { method: 'GET', path: '/admin', handler: () => handleAdminUI(request, env, sys) },
       { method: 'POST', path: '/update', handler: () => handleUpdate(request, env, ctx) },
